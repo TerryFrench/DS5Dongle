@@ -1,9 +1,15 @@
 name: Daily upstream auto-release
 
 # Once a day (and on demand) check awalol/DS5Dongle master. If it has a commit
-# we have not released yet, tag it auto-YYYY-MM-DD-<shortsha>, build the
-# firmware via the reusable workflow, and publish a downloadable release so
-# users never have to build it themselves.
+# we have not released yet, publish a release auto-YYYY-MM-DD-<shortsha> and
+# attach a firmware UF2 built straight from upstream, so users never have to
+# build it themselves.
+#
+# IMPORTANT: we never push upstream's commits/tags into this fork. The default
+# GITHUB_TOKEN is not allowed to push refs that change .github/workflows, and
+# upstream's workflow files differ from ours. Instead the release tag points
+# at our own default-branch commit (github.sha) and the build job checks out
+# upstream directly from its public repo. No PAT required.
 #
 # Releases the upstream master AS-IS (no local patches) -> fully unattended,
 # zero merge-conflict risk.
@@ -62,42 +68,20 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
 
-  tag-and-release:
-    name: Create tag and release
+  release:
+    name: Create release
     needs: detect
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Push tag at upstream commit (idempotent)
-        env:
-          TAG: ${{ needs.detect.outputs.tag }}
-          SHA: ${{ needs.detect.outputs.sha }}
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
-            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag ${TAG} already on origin - skipping tag push."
-          else
-            git tag "${TAG}" "${SHA}"
-            git push origin "refs/tags/${TAG}"
-          fi
-
       - name: Create GitHub release (idempotent)
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.detect.outputs.tag }}
           SHA: ${{ needs.detect.outputs.sha }}
+          TARGET: ${{ github.sha }}
         run: |
           set -euo pipefail
           if gh release view "${TAG}" >/dev/null 2>&1; then
@@ -105,19 +89,25 @@ jobs:
             exit 0
           fi
           NOTES="Automated build of upstream ${UPSTREAM_REPO} ${UPSTREAM_BRANCH} @ ${SHA}. Released as-is from upstream (no local patches). UF2 assets are attached by the build job. Flash: hold BOOTSEL, plug in the Pico2W, drag ds5-bridge-${TAG}.uf2 onto the drive."
+          # --target is our OWN default-branch commit (not upstream's), so the
+          # tag introduces no foreign workflow files -> no PAT needed.
           gh release create "${TAG}" \
-            --target "${SHA}" \
+            --target "${TARGET}" \
             --title "${TAG}" \
             --notes "${NOTES}"
 
   build:
     name: Build and attach firmware
-    needs: [detect, tag-and-release]
+    needs: [detect, release]
     if: needs.detect.outputs.changed == 'true'
     permissions:
       contents: write
     uses: ./.github/workflows/build-firmware.yml
     with:
-      ref: ${{ needs.detect.outputs.tag }}
+      # Literal (env context isn't available in reusable-workflow `with`);
+      # keep in sync with the UPSTREAM_REPO env above.
+      repo: awalol/DS5Dongle
+      ref: ${{ needs.detect.outputs.sha }}
+      version: ${{ needs.detect.outputs.tag }}
       asset_suffix: -${{ needs.detect.outputs.tag }}
       upload_tag: ${{ needs.detect.outputs.tag }}

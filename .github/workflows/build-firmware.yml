@@ -7,8 +7,18 @@ name: Build firmware (reusable)
 on:
   workflow_call:
     inputs:
+      repo:
+        description: owner/name to build. Empty = this repository.
+        required: false
+        type: string
+        default: ""
       ref:
         description: Git ref (branch, tag or SHA) to build
+        required: false
+        type: string
+        default: ""
+      version:
+        description: Firmware version string (-DVERSION). Empty = CMake default ("dev")
         required: false
         type: string
         default: ""
@@ -47,6 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          repository: ${{ inputs.repo == '' && github.repository || inputs.repo }}
           ref: ${{ inputs.ref }}
           submodules: recursive
 
@@ -96,21 +107,31 @@ jobs:
           git -C "$PICO_SDK_PATH/lib/tinyusb" checkout --detach "$TINYUSB_REF"
 
       - name: Build standard firmware
+        env:
+          FIRMWARE_VERSION: ${{ inputs.version }}
         run: |
+          VERSION_ARG=()
+          [ -n "$FIRMWARE_VERSION" ] && VERSION_ARG=(-DVERSION="$FIRMWARE_VERSION")
           cmake -S . -B build/standard -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPICO_SDK_PATH="$PICO_SDK_PATH"
+            -DPICO_SDK_PATH="$PICO_SDK_PATH" \
+            "${VERSION_ARG[@]}"
           cmake --build build/standard --target ds5-bridge
           mkdir -p artifacts
           cp build/standard/ds5-bridge.uf2 "artifacts/ds5-bridge${{ inputs.asset_suffix }}.uf2"
 
       - name: Build Debug firmware
+        env:
+          FIRMWARE_VERSION: ${{ inputs.version }}
         run: |
+          VERSION_ARG=()
+          [ -n "$FIRMWARE_VERSION" ] && VERSION_ARG=(-DVERSION="$FIRMWARE_VERSION")
           cmake -S . -B build/debug -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DPICO_SDK_PATH="$PICO_SDK_PATH" \
             -DENABLE_SERIAL=ON \
-            -DENABLE_VERBOSE=ON
+            -DENABLE_VERBOSE=ON \
+            "${VERSION_ARG[@]}"
           cmake --build build/debug --target ds5-bridge
           cp build/debug/ds5-bridge.uf2 "artifacts/ds5-bridge-debug${{ inputs.asset_suffix }}.uf2"
 
@@ -126,4 +147,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ inputs.upload_tag }}" artifacts/*.uf2 --clobber
+          # Pin to the workflow's own repo: when inputs.repo is set we checked
+          # out a different repo, so the local git remote must not decide this.
+          gh release upload "${{ inputs.upload_tag }}" artifacts/*.uf2 \
+            --repo "${{ github.repository }}" --clobber
