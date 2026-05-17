@@ -46,8 +46,12 @@ jobs:
           TAG="auto-$(date -u +%F)-${SHORT}"
           echo "Upstream ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} = ${UPSTREAM_SHA}"
 
-          # Already released this upstream commit? (any tag ending in -<shortsha>)
-          EXISTING="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/*-${SHORT}" | head -n1 || true)"
+          # Already released this upstream commit? (any auto-* tag ending in
+          # -<shortsha>). NOTE: git ls-remote does NOT glob, so list all tags
+          # and match the suffix ourselves.
+          EXISTING="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" \
+            | sed -e 's#^.*refs/tags/##' -e 's#\^{}$##' \
+            | grep -E "^auto-.*-${SHORT}\$" | head -n1 || true)"
           if [ -n "$EXISTING" ]; then
             echo "Upstream commit ${SHORT} already released ($EXISTING) - nothing to do."
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -71,29 +75,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Push tag at upstream commit
+      - name: Push tag at upstream commit (idempotent)
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          SHA: ${{ needs.detect.outputs.sha }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
-          git tag "${{ needs.detect.outputs.tag }}" "${{ needs.detect.outputs.sha }}"
-          git push origin "refs/tags/${{ needs.detect.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already on origin - skipping tag push."
+          else
+            git tag "${TAG}" "${SHA}"
+            git push origin "refs/tags/${TAG}"
+          fi
 
-      - name: Create GitHub release
+      - name: Create GitHub release (idempotent)
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          SHA: ${{ needs.detect.outputs.sha }}
         run: |
           set -euo pipefail
-          gh release create "${{ needs.detect.outputs.tag }}" \
-            --target "${{ needs.detect.outputs.sha }}" \
-            --title "${{ needs.detect.outputs.tag }}" \
-            --notes "Automated build of upstream [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) \`${UPSTREAM_BRANCH}\` @ \`${{ needs.detect.outputs.sha }}\`.
-
-          Released as-is from upstream (no local patches). UF2 assets are attached by the build job.
-
-          Flash: hold BOOTSEL, plug in the Pico2W, drag \`ds5-bridge-${{ needs.detect.outputs.tag }}.uf2\` onto the drive."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists - skipping creation."
+            exit 0
+          fi
+          NOTES="Automated build of upstream ${UPSTREAM_REPO} ${UPSTREAM_BRANCH} @ ${SHA}. Released as-is from upstream (no local patches). UF2 assets are attached by the build job. Flash: hold BOOTSEL, plug in the Pico2W, drag ds5-bridge-${TAG}.uf2 onto the drive."
+          gh release create "${TAG}" \
+            --target "${SHA}" \
+            --title "${TAG}" \
+            --notes "${NOTES}"
 
   build:
     name: Build and attach firmware
