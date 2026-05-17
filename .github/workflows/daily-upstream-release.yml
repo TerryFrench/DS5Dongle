@@ -1,0 +1,108 @@
+name: Daily upstream auto-release
+
+# Once a day (and on demand) check awalol/DS5Dongle master. If it has a commit
+# we have not released yet, tag it auto-YYYY-MM-DD-<shortsha>, build the
+# firmware via the reusable workflow, and publish a downloadable release so
+# users never have to build it themselves.
+#
+# Releases the upstream master AS-IS (no local patches) -> fully unattended,
+# zero merge-conflict risk.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: awalol/DS5Dongle
+  UPSTREAM_BRANCH: master
+
+jobs:
+  detect:
+    name: Detect upstream change
+    runs-on: ubuntu-latest
+    # Guard: don't run if this workflow file ever lands on the upstream repo.
+    if: github.repository != 'awalol/DS5Dongle'
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: Resolve upstream HEAD and decide
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | cut -f1)"
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "Could not resolve upstream HEAD" >&2
+            exit 1
+          fi
+          SHORT="${UPSTREAM_SHA:0:7}"
+          TAG="auto-$(date -u +%F)-${SHORT}"
+          echo "Upstream ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} = ${UPSTREAM_SHA}"
+
+          # Already released this upstream commit? (any tag ending in -<shortsha>)
+          EXISTING="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/*-${SHORT}" | head -n1 || true)"
+          if [ -n "$EXISTING" ]; then
+            echo "Upstream commit ${SHORT} already released ($EXISTING) - nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream commit ${SHORT} -> will release as ${TAG}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+
+  tag-and-release:
+    name: Create tag and release
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push tag at upstream commit
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git tag "${{ needs.detect.outputs.tag }}" "${{ needs.detect.outputs.sha }}"
+          git push origin "refs/tags/${{ needs.detect.outputs.tag }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ needs.detect.outputs.tag }}" \
+            --target "${{ needs.detect.outputs.sha }}" \
+            --title "${{ needs.detect.outputs.tag }}" \
+            --notes "Automated build of upstream [${UPSTREAM_REPO}](https://github.com/${UPSTREAM_REPO}) \`${UPSTREAM_BRANCH}\` @ \`${{ needs.detect.outputs.sha }}\`.
+
+          Released as-is from upstream (no local patches). UF2 assets are attached by the build job.
+
+          Flash: hold BOOTSEL, plug in the Pico2W, drag \`ds5-bridge-${{ needs.detect.outputs.tag }}.uf2\` onto the drive."
+
+  build:
+    name: Build and attach firmware
+    needs: [detect, tag-and-release]
+    if: needs.detect.outputs.changed == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-firmware.yml
+    with:
+      ref: ${{ needs.detect.outputs.tag }}
+      asset_suffix: -${{ needs.detect.outputs.tag }}
+      upload_tag: ${{ needs.detect.outputs.tag }}
