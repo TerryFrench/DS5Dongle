@@ -7,6 +7,11 @@ name: Build firmware (reusable)
 on:
   workflow_call:
     inputs:
+      repo:
+        description: owner/name to build. Empty = this repository.
+        required: false
+        type: string
+        default: ""
       ref:
         description: Git ref (branch, tag or SHA) to build
         required: false
@@ -52,6 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          repository: ${{ inputs.repo == '' && github.repository || inputs.repo }}
           ref: ${{ inputs.ref }}
           submodules: recursive
 
@@ -141,4 +147,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ inputs.upload_tag }}" artifacts/*.uf2 --clobber
+          # Pin to the workflow's own repo: when inputs.repo is set we checked
+          # out a different repo, so the local git remote must not decide this.
+          gh release upload "${{ inputs.upload_tag }}" artifacts/*.uf2 \
+            --repo "${{ github.repository }}" --clobber
