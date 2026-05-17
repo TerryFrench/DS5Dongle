@@ -94,17 +94,25 @@ If your device fails to boot:
 
 ### Windows 11 (one command, no WSL)
 
-Run this in **PowerShell** from the repo root:
+You don't even need to clone this repo. Download just
+[`tools/build-windows.ps1`](tools/build-windows.ps1) to any folder and run
+it in **PowerShell**:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 ```
+
+(If you already have a checkout, run `tools\build-windows.ps1` from the
+repo root instead — it detects and uses your local checkout.)
 
 The script installs every prerequisite (CMake, Ninja, Python, Git and the
 ARM GNU toolchain — via `winget`, falling back to portable downloads if
-`winget` is unavailable), fetches the pinned Pico SDK + TinyUSB, builds the
-firmware, and drops `ds5-bridge.uf2` next to the script and on your Desktop.
-It is safe to re-run; already-installed tools are skipped.
+`winget` is unavailable), clones the project (if not run from a checkout)
+plus the pinned Pico SDK + TinyUSB into `%USERPROFILE%\.ds5-build`, builds
+the firmware, and drops `ds5-bridge.uf2` next to the script and on your
+Desktop. It is safe to re-run; already-installed tools are skipped.
+
+Build a fork or a specific ref with `-Repo <url>` / `-Ref <branch|tag>`.
 
 Build a variant with `-Variant debug` or `-Variant wake`.
 

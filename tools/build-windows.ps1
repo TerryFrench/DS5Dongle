@@ -21,18 +21,38 @@
 .PARAMETER Clean
     Delete the variant's build directory before configuring.
 
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1
+.PARAMETER Repo
+    When run standalone (the script is not inside a checkout), the project
+    git URL to clone. Defaults to the upstream project. Override to build a
+    fork.
+
+.PARAMETER Ref
+    Branch, tag or commit to build when cloned standalone. Empty = the
+    repo's default branch.
 
 .EXAMPLE
+    # Standalone: download just this file anywhere and run it - it clones
+    # the project under %USERPROFILE%\.ds5-build and builds it.
+    powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
+
+.EXAMPLE
+    # From inside a cloned repo:
     powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1 -Variant wake
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\build-windows.ps1 -Repo https://github.com/youruser/DS5Dongle.git -Ref master
 #>
 
 [CmdletBinding()]
 param(
     [ValidateSet('standard', 'debug', 'wake')]
     [string]$Variant = 'standard',
-    [switch]$Clean
+    [switch]$Clean,
+    # Project to build when this script is run standalone (not from inside a
+    # checkout). Override to build a fork.
+    [string]$Repo = 'https://github.com/awalol/DS5Dongle.git',
+    # Branch/tag/SHA to build when cloned standalone. Empty = default branch.
+    [string]$Ref = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,10 +65,13 @@ $ARM_VER      = '14.2.rel1'
 $ARM_ZIP      = "arm-gnu-toolchain-$ARM_VER-mingw-w64-x86_64-arm-none-eabi.zip"
 $ARM_URL      = "https://developer.arm.com/-/media/Files/downloads/gnu/$ARM_VER/binrel/$ARM_ZIP"
 
-$RepoRoot  = Split-Path -Parent $PSScriptRoot
 $ToolsHome = Join-Path $env:USERPROFILE '.ds5-build'
 $SdkPath   = Join-Path $ToolsHome 'pico-sdk'
 $ArmRoot   = Join-Path $ToolsHome 'arm-gnu-toolchain'
+$ClonePath = Join-Path $ToolsHome 'DS5Dongle'
+# $RepoRoot is resolved at runtime (Resolve-RepoRoot) - either an existing
+# checkout this script sits in, or a fresh clone under $ToolsHome.
+$RepoRoot  = $null
 
 function Info  ($m) { Write-Host "[ds5] $m"            -ForegroundColor Cyan }
 function Ok    ($m) { Write-Host "[ds5] $m"            -ForegroundColor Green }
@@ -204,6 +227,45 @@ function Ensure-PicoSdk {
     }
 }
 
+# --- Locate the project: existing checkout, or clone under $ToolsHome --------
+function Test-Ds5Checkout ($dir) {
+    if (-not $dir) { return $false }
+    $cml = Join-Path $dir 'CMakeLists.txt'
+    return (Test-Path $cml) -and (Select-String -Path $cml -Pattern 'ds5-bridge' -Quiet)
+}
+
+function Resolve-RepoRoot {
+    # Run from inside a checkout? (script at <repo>/tools/ or at <repo>/)
+    foreach ($cand in @((Split-Path -Parent $PSScriptRoot), $PSScriptRoot)) {
+        if (Test-Ds5Checkout $cand) {
+            Ok "Using existing checkout: $cand"
+            return $cand
+        }
+    }
+    # Standalone: clone (or refresh) the project under $ToolsHome.
+    if (Test-Path (Join-Path $ClonePath '.git')) {
+        Info "Refreshing existing clone: $ClonePath"
+        git -C $ClonePath remote set-url origin $Repo
+        git -C $ClonePath fetch --tags --prune origin
+        if ($Ref) {
+            $target = $Ref
+        } else {
+            $head = (git -C $ClonePath symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null)
+            $target = if ($head) { $head.Split('/')[-1] } else { 'master' }
+        }
+        git -C $ClonePath checkout --force $target
+        git -C $ClonePath pull --ff-only 2>$null
+    } else {
+        Info "Cloning $Repo into $ClonePath ..."
+        $cloneArgs = @('clone', '--recurse-submodules', $Repo, $ClonePath)
+        if ($Ref) { $cloneArgs += @('--branch', $Ref) }
+        git @cloneArgs
+        if ($LASTEXITCODE -ne 0) { Die "Failed to clone $Repo" }
+    }
+    if (-not (Test-Ds5Checkout $ClonePath)) { Die "Clone at $ClonePath is not a DS5Dongle project." }
+    return $ClonePath
+}
+
 # ---------------------------------------------------------------------------- #
 #  Main                                                                        #
 # ---------------------------------------------------------------------------- #
@@ -245,9 +307,14 @@ Ensure-Tool -Command 'python' -WingetId 'Python.Python.3.12' -WingetAvailable $u
 Ensure-ArmToolchain
 Ensure-PicoSdk
 
+# --- Locate / fetch the project source --------------------------------------
+$RepoRoot = Resolve-RepoRoot
+Ok "Project source: $RepoRoot"
+
 # --- Project submodules (lib/WDL, lib/opus per .gitmodules) -------------------
 Info 'Initialising project submodules (WDL, opus)...'
 git -C $RepoRoot submodule update --init --recursive
+if ($LASTEXITCODE -ne 0) { Die 'Submodule init failed (lib/WDL, lib/opus).' }
 
 # --- Configure + build -------------------------------------------------------
 $buildDir = Join-Path $RepoRoot "build\$Variant"
