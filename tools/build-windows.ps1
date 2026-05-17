@@ -243,23 +243,27 @@ function Resolve-RepoRoot {
         }
     }
     # Standalone: clone (or refresh) the project under $ToolsHome.
+    # NOTE: every git call here is piped to Out-Host. A function's uncaptured
+    # native stdout becomes part of its return value in PowerShell, so without
+    # this $RepoRoot would also contain git's "Submodule path ..." chatter.
     if (Test-Path (Join-Path $ClonePath '.git')) {
         Info "Refreshing existing clone: $ClonePath"
-        git -C $ClonePath remote set-url origin $Repo
-        git -C $ClonePath fetch --tags --prune origin
+        git -C $ClonePath remote set-url origin $Repo 2>&1 | Out-Host
+        git -C $ClonePath fetch --tags --prune origin 2>&1 | Out-Host
         if ($Ref) {
             $target = $Ref
         } else {
             $head = (git -C $ClonePath symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null)
             $target = if ($head) { $head.Split('/')[-1] } else { 'master' }
         }
-        git -C $ClonePath checkout --force $target
-        git -C $ClonePath pull --ff-only 2>$null
+        git -C $ClonePath checkout --force $target 2>&1 | Out-Host
+        git -C $ClonePath submodule update --init --recursive 2>&1 | Out-Host
+        git -C $ClonePath pull --ff-only 2>&1 | Out-Host
     } else {
         Info "Cloning $Repo into $ClonePath ..."
         $cloneArgs = @('clone', '--recurse-submodules', $Repo, $ClonePath)
         if ($Ref) { $cloneArgs += @('--branch', $Ref) }
-        git @cloneArgs
+        git @cloneArgs 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) { Die "Failed to clone $Repo" }
     }
     if (-not (Test-Ds5Checkout $ClonePath)) { Die "Clone at $ClonePath is not a DS5Dongle project." }
