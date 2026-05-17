@@ -58,6 +58,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Bump on every change so a stale download is obvious in the banner.
+$SCRIPT_REV   = '2026-05-16.4'
+
 # --- Pinned versions: keep in sync with .github/workflows/build-firmware.yml ---
 $PICO_SDK_REF = '2.2.0'
 $TINYUSB_REF  = '0.20.0'
@@ -234,46 +237,56 @@ function Test-Ds5Checkout ($dir) {
     return (Test-Path $cml) -and (Select-String -Path $cml -Pattern 'ds5-bridge' -Quiet)
 }
 
+# Runs git so NOTHING reaches the pipeline: stdout+stderr both go to the
+# host. This is the root-cause guard - any uncaptured native stdout inside a
+# function becomes part of its return value in PowerShell.
+function Invoke-GitQuiet {
+    & git @args *>&1 | Out-Host
+}
+
+# Sets $script:RepoRoot (does NOT return it) so stray git output can never
+# contaminate the value, regardless of which stream git writes to.
 function Resolve-RepoRoot {
+    $script:RepoRoot = $null
     # Run from inside a checkout? (script at <repo>/tools/ or at <repo>/)
     foreach ($cand in @((Split-Path -Parent $PSScriptRoot), $PSScriptRoot)) {
         if (Test-Ds5Checkout $cand) {
             Ok "Using existing checkout: $cand"
-            return $cand
+            $script:RepoRoot = $cand
+            return
         }
     }
     # Standalone: clone (or refresh) the project under $ToolsHome.
-    # NOTE: every git call here is piped to Out-Host. A function's uncaptured
-    # native stdout becomes part of its return value in PowerShell, so without
-    # this $RepoRoot would also contain git's "Submodule path ..." chatter.
     if (Test-Path (Join-Path $ClonePath '.git')) {
         Info "Refreshing existing clone: $ClonePath"
-        git -C $ClonePath remote set-url origin $Repo 2>&1 | Out-Host
-        git -C $ClonePath fetch --tags --prune origin 2>&1 | Out-Host
+        Invoke-GitQuiet -C $ClonePath remote set-url origin $Repo
+        Invoke-GitQuiet -C $ClonePath fetch --tags --prune origin
         if ($Ref) {
             $target = $Ref
         } else {
-            $head = (git -C $ClonePath symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null)
-            $target = if ($head) { $head.Split('/')[-1] } else { 'master' }
+            $head = (& git -C $ClonePath symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>$null)
+            $target = if ($head) { ($head | Select-Object -Last 1).ToString().Split('/')[-1] } else { 'master' }
         }
-        git -C $ClonePath checkout --force $target 2>&1 | Out-Host
-        git -C $ClonePath submodule update --init --recursive 2>&1 | Out-Host
-        git -C $ClonePath pull --ff-only 2>&1 | Out-Host
+        Invoke-GitQuiet -C $ClonePath checkout --force $target
+        Invoke-GitQuiet -C $ClonePath submodule update --init --recursive
+        Invoke-GitQuiet -C $ClonePath pull --ff-only
     } else {
         Info "Cloning $Repo into $ClonePath ..."
-        $cloneArgs = @('clone', '--recurse-submodules', $Repo, $ClonePath)
-        if ($Ref) { $cloneArgs += @('--branch', $Ref) }
-        git @cloneArgs 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) { Die "Failed to clone $Repo" }
+        if ($Ref) {
+            Invoke-GitQuiet clone --recurse-submodules --branch $Ref $Repo $ClonePath
+        } else {
+            Invoke-GitQuiet clone --recurse-submodules $Repo $ClonePath
+        }
+        if (-not (Test-Path (Join-Path $ClonePath '.git'))) { Die "Failed to clone $Repo" }
     }
     if (-not (Test-Ds5Checkout $ClonePath)) { Die "Clone at $ClonePath is not a DS5Dongle project." }
-    return $ClonePath
+    $script:RepoRoot = $ClonePath
 }
 
 # ---------------------------------------------------------------------------- #
 #  Main                                                                        #
 # ---------------------------------------------------------------------------- #
-Info "DS5Dongle Windows builder - variant: $Variant"
+Info "DS5Dongle Windows builder (rev $SCRIPT_REV) - variant: $Variant"
 New-Item -ItemType Directory -Force -Path $ToolsHome | Out-Null
 Add-CommonToolPaths
 
@@ -312,12 +325,15 @@ Ensure-ArmToolchain
 Ensure-PicoSdk
 
 # --- Locate / fetch the project source --------------------------------------
-$RepoRoot = Resolve-RepoRoot
+Resolve-RepoRoot   # sets $script:RepoRoot
+if (-not $RepoRoot -or -not (Test-Ds5Checkout $RepoRoot)) {
+    Die "Could not locate the DS5Dongle source (resolved: '$RepoRoot')."
+}
 Ok "Project source: $RepoRoot"
 
 # --- Project submodules (lib/WDL, lib/opus per .gitmodules) -------------------
 Info 'Initialising project submodules (WDL, opus)...'
-git -C $RepoRoot submodule update --init --recursive
+Invoke-GitQuiet -C $RepoRoot submodule update --init --recursive
 if ($LASTEXITCODE -ne 0) { Die 'Submodule init failed (lib/WDL, lib/opus).' }
 
 # --- Configure + build -------------------------------------------------------
