@@ -59,7 +59,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Bump on every change so a stale download is obvious in the banner.
-$SCRIPT_REV   = '2026-05-16.4'
+$SCRIPT_REV   = '2026-05-16.5'
 
 # --- Pinned versions: keep in sync with .github/workflows/build-firmware.yml ---
 $PICO_SDK_REF = '2.2.0'
@@ -75,6 +75,7 @@ $ClonePath = Join-Path $ToolsHome 'DS5Dongle'
 # $RepoRoot is resolved at runtime (Resolve-RepoRoot) - either an existing
 # checkout this script sits in, or a fresh clone under $ToolsHome.
 $RepoRoot  = $null
+$GitExit   = 0   # last git exit code, set by Invoke-GitQuiet
 
 function Info  ($m) { Write-Host "[ds5] $m"            -ForegroundColor Cyan }
 function Ok    ($m) { Write-Host "[ds5] $m"            -ForegroundColor Green }
@@ -237,11 +238,22 @@ function Test-Ds5Checkout ($dir) {
     return (Test-Path $cml) -and (Select-String -Path $cml -Pattern 'ds5-bridge' -Quiet)
 }
 
-# Runs git so NOTHING reaches the pipeline: stdout+stderr both go to the
-# host. This is the root-cause guard - any uncaptured native stdout inside a
-# function becomes part of its return value in PowerShell.
+# Runs git so NOTHING reaches the pipeline: every stream is written to the
+# host instead. Two PowerShell hazards handled here:
+#  1. Uncaptured native stdout inside a function becomes its return value.
+#  2. With $ErrorActionPreference='Stop', git writing to stderr (it uses it
+#     for normal progress, e.g. "Already on 'master'") raises a terminating
+#     NativeCommandError. So we relax it locally and judge by exit code.
+# Sets $script:GitExit to git's real exit code; emits nothing.
 function Invoke-GitQuiet {
-    & git @args *>&1 | Out-Host
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git @args 2>&1 | ForEach-Object { Write-Host $_ }
+        $script:GitExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
 }
 
 # Sets $script:RepoRoot (does NOT return it) so stray git output can never
@@ -334,7 +346,7 @@ Ok "Project source: $RepoRoot"
 # --- Project submodules (lib/WDL, lib/opus per .gitmodules) -------------------
 Info 'Initialising project submodules (WDL, opus)...'
 Invoke-GitQuiet -C $RepoRoot submodule update --init --recursive
-if ($LASTEXITCODE -ne 0) { Die 'Submodule init failed (lib/WDL, lib/opus).' }
+if ($GitExit -ne 0) { Die 'Submodule init failed (lib/WDL, lib/opus).' }
 
 # --- Configure + build -------------------------------------------------------
 $buildDir = Join-Path $RepoRoot "build\$Variant"
