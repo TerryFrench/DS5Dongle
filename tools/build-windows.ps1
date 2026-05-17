@@ -59,7 +59,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Bump on every change so a stale download is obvious in the banner.
-$SCRIPT_REV   = '2026-05-16.5'
+$SCRIPT_REV   = '2026-05-16.6'
 
 # --- Pinned versions: keep in sync with .github/workflows/build-firmware.yml ---
 $PICO_SDK_REF = '2.2.0'
@@ -75,7 +75,8 @@ $ClonePath = Join-Path $ToolsHome 'DS5Dongle'
 # $RepoRoot is resolved at runtime (Resolve-RepoRoot) - either an existing
 # checkout this script sits in, or a fresh clone under $ToolsHome.
 $RepoRoot  = $null
-$GitExit   = 0   # last git exit code, set by Invoke-GitQuiet
+$GitExit   = 0     # last git exit code, set by Invoke-GitQuiet
+$PythonExe = $null # real Python 3 interpreter, set by Resolve-Python
 
 function Info  ($m) { Write-Host "[ds5] $m"            -ForegroundColor Cyan }
 function Ok    ($m) { Write-Host "[ds5] $m"            -ForegroundColor Green }
@@ -295,6 +296,70 @@ function Resolve-RepoRoot {
     $script:RepoRoot = $ClonePath
 }
 
+# --- Real Python 3 (CMake's FindPython3 needs one) --------------------------
+# Clean Windows / Windows Sandbox ships a Microsoft Store "python.exe" alias
+# under \WindowsApps that is NOT an interpreter - Get-Command finds it but
+# CMake rejects it. Resolve a genuine interpreter and pass it to CMake.
+function Test-RealPython ($exe) {
+    if (-not $exe) { return $false }
+    if ("$exe" -like '*\WindowsApps\*') { return $false }   # Store alias stub
+    try {
+        $v = (& $exe --version 2>&1 | Out-String)
+        return ($v -match 'Python\s+3\.')
+    } catch { return $false }
+}
+
+function Resolve-Python {
+    if (Have 'py') {
+        try {
+            $p = (& py -3 -c 'import sys;print(sys.executable)' 2>$null | Select-Object -Last 1)
+            if (Test-RealPython $p) { $script:PythonExe = "$p"; Ok "Python: $p"; return }
+        } catch {}
+    }
+    foreach ($name in @('python', 'python3')) {
+        $c = Get-Command $name -ErrorAction SilentlyContinue
+        if ($c -and (Test-RealPython $c.Source)) {
+            $script:PythonExe = $c.Source; Ok "Python: $($c.Source)"; return
+        }
+    }
+    if ($useWinget) {
+        Info 'Installing Python 3.12 via winget...'
+        winget install --id Python.Python.3.12 --exact --silent --accept-source-agreements `
+            --accept-package-agreements --disable-interactivity | Out-Host
+        Add-CommonToolPaths
+    }
+    $globs = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python3*\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\Python.Python.3.12_*\python.exe'),
+        (Join-Path $env:ProgramFiles 'Python3*\python.exe'),
+        'C:\Python3*\python.exe'
+    )
+    foreach ($g in $globs) {
+        $hit = Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit -and (Test-RealPython $hit.FullName)) {
+            $script:PythonExe = $hit.FullName
+            Add-SessionPath (Split-Path $hit.FullName)
+            Ok "Python: $($hit.FullName)"; return
+        }
+    }
+    # Last resort: portable embeddable build (enough for the SDK's scripts).
+    Info 'Installing portable Python (embeddable)...'
+    $pyDir = Join-Path $ToolsHome 'python'
+    if (-not (Test-Path (Join-Path $pyDir 'python.exe'))) {
+        $zip = Join-Path $env:TEMP 'python-embed.zip'
+        Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            -Uri 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip'
+        New-Item -ItemType Directory -Force -Path $pyDir | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $pyDir -Force
+        Remove-Item $zip -Force
+    }
+    $pyExe = Join-Path $pyDir 'python.exe'
+    if (Test-RealPython $pyExe) {
+        $script:PythonExe = $pyExe; Add-SessionPath $pyDir; Ok "Python: $pyExe"; return
+    }
+    Die 'Could not provide a working Python 3 interpreter.'
+}
+
 # ---------------------------------------------------------------------------- #
 #  Main                                                                        #
 # ---------------------------------------------------------------------------- #
@@ -328,10 +393,7 @@ Ensure-Tool -Command 'ninja'  -WingetId 'Ninja-build.Ninja'  -WingetAvailable $u
     Install-PortableArchiveTool -Name 'ninja' `
         -Url 'https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip' ''
 }
-Ensure-Tool -Command 'python' -WingetId 'Python.Python.3.12' -WingetAvailable $useWinget -PortableInstall {
-    Install-PortableArchiveTool -Name 'python' `
-        -Url 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip' ''
-}
+Resolve-Python   # sets $script:PythonExe (handles the Store alias stub)
 
 Ensure-ArmToolchain
 Ensure-PicoSdk
@@ -358,7 +420,8 @@ if ($Clean -and (Test-Path $buildDir)) {
 $cmakeArgs = @(
     '-S', $RepoRoot, '-B', $buildDir, '-G', 'Ninja',
     '-DCMAKE_BUILD_TYPE=Release',
-    "-DPICO_SDK_PATH=$SdkPath"
+    "-DPICO_SDK_PATH=$SdkPath",
+    "-DPython3_EXECUTABLE=$($PythonExe -replace '\\','/')"
 )
 switch ($Variant) {
     'debug' { $cmakeArgs += @('-DENABLE_SERIAL=ON', '-DENABLE_VERBOSE=ON') }
