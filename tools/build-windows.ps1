@@ -59,7 +59,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Bump on every change so a stale download is obvious in the banner.
-$SCRIPT_REV   = '2026-05-16.6'
+$SCRIPT_REV   = '2026-05-16.7'
 
 # --- Pinned versions: keep in sync with .github/workflows/build-firmware.yml ---
 $PICO_SDK_REF = '2.2.0'
@@ -67,6 +67,8 @@ $TINYUSB_REF  = '0.20.0'
 $ARM_VER      = '14.2.rel1'
 $ARM_ZIP      = "arm-gnu-toolchain-$ARM_VER-mingw-w64-x86_64-arm-none-eabi.zip"
 $ARM_URL      = "https://developer.arm.com/-/media/Files/downloads/gnu/$ARM_VER/binrel/$ARM_ZIP"
+# Portable native host compiler (WinLibs MinGW-w64 UCRT) for pioasm/picotool.
+$MINGW_URL    = 'https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.1-12.0.0-ucrt-r2/winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r2.zip'
 
 $ToolsHome = Join-Path $env:USERPROFILE '.ds5-build'
 $SdkPath   = Join-Path $ToolsHome 'pico-sdk'
@@ -207,6 +209,42 @@ function Ensure-ArmToolchain {
     if (-not $armBin) { Die 'ARM toolchain extraction failed.' }
     Add-SessionPath (Split-Path $armBin.FullName)
     Ok "ARM toolchain ready: $($armBin.Directory)"
+}
+
+# --- Host C/C++ compiler (for pico-sdk host tools: pioasm, picotool) ---------
+# These run on the PC, not the RP2350, so they need a NATIVE compiler - the
+# ARM cross-compiler cannot build them. Use MSVC if present, else a portable
+# MinGW-w64.
+function Ensure-HostCompiler {
+    if (Have 'cl') { Ok 'Host compiler: MSVC (cl) on PATH'; return }
+    # g++ on PATH that is NOT the arm-none-eabi cross-compiler
+    $g = Get-Command 'g++' -ErrorAction SilentlyContinue
+    if ($g -and $g.Source -notlike '*arm-none-eabi*') {
+        Ok "Host compiler: $($g.Source)"
+        $env:CC = 'gcc'; $env:CXX = 'g++'
+        return
+    }
+    $mwRoot = Join-Path $ToolsHome 'mingw64'
+    $gpp = Get-ChildItem -Path $mwRoot -Recurse -Filter 'g++.exe' `
+        -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $gpp) {
+        Info 'Downloading portable MinGW-w64 host compiler (~120 MB, one-time)...'
+        New-Item -ItemType Directory -Force -Path $mwRoot | Out-Null
+        $zip = Join-Path $env:TEMP 'winlibs-mingw.zip'
+        Invoke-WebRequest -UseBasicParsing -OutFile $zip -Uri $MINGW_URL
+        Info 'Extracting MinGW-w64...'
+        Expand-Archive -Path $zip -DestinationPath $mwRoot -Force
+        Remove-Item $zip -Force
+        $gpp = Get-ChildItem -Path $mwRoot -Recurse -Filter 'g++.exe' |
+            Select-Object -First 1
+    }
+    if (-not $gpp) { Die 'Failed to provide a host C++ compiler.' }
+    $binDir = Split-Path $gpp.FullName
+    Add-SessionPath $binDir
+    # Force host sub-builds (pioasm/picotool ExternalProjects) to use MinGW.
+    $env:CC  = (Join-Path $binDir 'gcc.exe')
+    $env:CXX = (Join-Path $binDir 'g++.exe')
+    Ok "Host compiler: $binDir"
 }
 
 # --- Pico SDK 2.2.0 + TinyUSB 0.20.0 (mirrors build-firmware.yml) -------------
@@ -396,6 +434,7 @@ Ensure-Tool -Command 'ninja'  -WingetId 'Ninja-build.Ninja'  -WingetAvailable $u
 Resolve-Python   # sets $script:PythonExe (handles the Store alias stub)
 
 Ensure-ArmToolchain
+Ensure-HostCompiler
 Ensure-PicoSdk
 
 # --- Locate / fetch the project source --------------------------------------
