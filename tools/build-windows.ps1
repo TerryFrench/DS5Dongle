@@ -1,0 +1,296 @@
+<#
+.SYNOPSIS
+    One-command builder for the Pico2W DualSense 5 Bridge firmware on Windows 11
+    (no WSL required).
+
+.DESCRIPTION
+    Installs every prerequisite (winget where possible, portable downloads as a
+    fallback), fetches the pinned Raspberry Pi Pico SDK + TinyUSB, initialises
+    this repo's submodules, then configures and builds the firmware with CMake +
+    Ninja. The resulting ds5-bridge.uf2 is copied next to this script and onto
+    your Desktop.
+
+    The script is idempotent: re-running it skips anything already installed or
+    downloaded.
+
+.PARAMETER Variant
+    standard (default) - normal firmware.
+    debug              - adds -DENABLE_SERIAL=ON -DENABLE_VERBOSE=ON.
+    wake               - adds -DENABLE_WAKE_HID=ON (Wake-on-PS build).
+
+.PARAMETER Clean
+    Delete the variant's build directory before configuring.
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File tools\build-windows.ps1 -Variant wake
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateSet('standard', 'debug', 'wake')]
+    [string]$Variant = 'standard',
+    [switch]$Clean
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# --- Pinned versions: keep in sync with .github/workflows/build-firmware.yml ---
+$PICO_SDK_REF = '2.2.0'
+$TINYUSB_REF  = '0.20.0'
+$ARM_VER      = '14.2.rel1'
+$ARM_ZIP      = "arm-gnu-toolchain-$ARM_VER-mingw-w64-x86_64-arm-none-eabi.zip"
+$ARM_URL      = "https://developer.arm.com/-/media/Files/downloads/gnu/$ARM_VER/binrel/$ARM_ZIP"
+
+$RepoRoot  = Split-Path -Parent $PSScriptRoot
+$ToolsHome = Join-Path $env:USERPROFILE '.ds5-build'
+$SdkPath   = Join-Path $ToolsHome 'pico-sdk'
+$ArmRoot   = Join-Path $ToolsHome 'arm-gnu-toolchain'
+
+function Info  ($m) { Write-Host "[ds5] $m"            -ForegroundColor Cyan }
+function Ok    ($m) { Write-Host "[ds5] $m"            -ForegroundColor Green }
+function Warn  ($m) { Write-Host "[ds5] WARNING: $m"   -ForegroundColor Yellow }
+function Die   ($m) { Write-Host "[ds5] ERROR: $m"     -ForegroundColor Red; exit 1 }
+
+function Have ($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
+
+function Add-SessionPath ($dir) {
+    if ($dir -and (Test-Path $dir) -and ($env:Path -notlike "*$dir*")) {
+        $env:Path = "$dir;$env:Path"
+    }
+}
+
+# --- Discover already-installed tools that aren't on PATH (common with winget) -
+function Add-CommonToolPaths {
+    $candidates = @(
+        "$env:ProgramFiles\CMake\bin",
+        "$env:ProgramFiles\Git\cmd",
+        "${env:ProgramFiles(x86)}\Git\cmd"
+    )
+    foreach ($c in $candidates) { Add-SessionPath $c }
+    # winget often installs Ninja/Python under WinGet Links or per-user dirs.
+    $wingetLinks = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links'
+    Add-SessionPath $wingetLinks
+}
+
+# --- Step 0: ensure winget exists, bootstrap if missing, else portable mode ----
+function Initialize-PackageManager {
+    if (Have winget) { Ok 'winget present.'; return $true }
+
+    Warn 'winget (App Installer) not found. Attempting automatic bootstrap...'
+    try {
+        $tmp = Join-Path $env:TEMP 'ds5-winget'
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+        $deps = @(
+            @{ name = 'VCLibs';
+               url  = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx' },
+            @{ name = 'AppInstaller';
+               url  = 'https://aka.ms/getwinget' }   # latest DesktopAppInstaller bundle
+        )
+        foreach ($d in $deps) {
+            $dest = Join-Path $tmp ($d.name + [IO.Path]::GetExtension($d.url))
+            if (-not $dest.EndsWith('.appx') -and -not $dest.EndsWith('.msixbundle')) {
+                $dest = Join-Path $tmp ($d.name + '.msixbundle')
+            }
+            Info "Downloading $($d.name)..."
+            Invoke-WebRequest -Uri $d.url -OutFile $dest -UseBasicParsing
+            Add-AppxPackage -Path $dest -ErrorAction Stop
+        }
+        # Refresh PATH for the App Execution Alias.
+        Add-SessionPath (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps')
+        if (Have winget) { Ok 'winget bootstrapped successfully.'; return $true }
+    }
+    catch {
+        Warn "winget bootstrap failed: $($_.Exception.Message)"
+    }
+
+    Warn 'Proceeding in PORTABLE mode (no winget) - tools downloaded locally.'
+    return $false
+}
+
+# --- winget install with portable fallback per tool --------------------------
+function Ensure-Tool {
+    param(
+        [string]$Command,
+        [string]$WingetId,
+        [bool]$WingetAvailable,
+        [scriptblock]$PortableInstall
+    )
+    if (Have $Command) { Ok "$Command already available."; return }
+
+    if ($WingetAvailable) {
+        Info "Installing $Command via winget ($WingetId)..."
+        winget install --id $WingetId --exact --silent --accept-source-agreements `
+            --accept-package-agreements --disable-interactivity | Out-Host
+        Add-CommonToolPaths
+        if (Have $Command) { Ok "$Command installed."; return }
+        Warn "$Command still not on PATH after winget; trying portable."
+    }
+
+    if ($PortableInstall) {
+        Info "Installing $Command (portable)..."
+        & $PortableInstall
+        if (Have $Command) { Ok "$Command installed (portable)."; return }
+    }
+    Die "Could not install '$Command'. Install it manually and re-run."
+}
+
+function Install-PortableArchiveTool {
+    param([string]$Name, [string]$Url, [string]$BinSubdir)
+    $base = Join-Path $ToolsHome $Name
+    $zip  = Join-Path $env:TEMP "$Name.zip"
+    if (-not (Test-Path $base)) {
+        Invoke-WebRequest -Uri $Url -OutFile $zip -UseBasicParsing
+        New-Item -ItemType Directory -Force -Path $base | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $base -Force
+        Remove-Item $zip -Force
+    }
+    $bin = if ($BinSubdir) { Join-Path $base $BinSubdir } else { $base }
+    # Some archives nest a single top-level folder.
+    if (-not (Test-Path $bin)) {
+        $inner = Get-ChildItem $base -Directory | Select-Object -First 1
+        if ($inner) { $bin = Join-Path $inner.FullName $BinSubdir }
+    }
+    Add-SessionPath $bin
+}
+
+# --- ARM GNU toolchain (always portable: winget package is stale ~10.x) ------
+function Ensure-ArmToolchain {
+    $armBin = Get-ChildItem -Path $ArmRoot -Recurse -Filter 'arm-none-eabi-gcc.exe' `
+        -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($armBin) {
+        Add-SessionPath (Split-Path $armBin.FullName)
+        Ok "ARM toolchain present: $($armBin.Directory)"
+        return
+    }
+    Info "Downloading ARM GNU toolchain $ARM_VER (~500 MB, one-time)..."
+    New-Item -ItemType Directory -Force -Path $ArmRoot | Out-Null
+    $zip = Join-Path $env:TEMP $ARM_ZIP
+    Invoke-WebRequest -Uri $ARM_URL -OutFile $zip -UseBasicParsing
+    Info 'Extracting ARM toolchain...'
+    Expand-Archive -Path $zip -DestinationPath $ArmRoot -Force
+    Remove-Item $zip -Force
+    $armBin = Get-ChildItem -Path $ArmRoot -Recurse -Filter 'arm-none-eabi-gcc.exe' |
+        Select-Object -First 1
+    if (-not $armBin) { Die 'ARM toolchain extraction failed.' }
+    Add-SessionPath (Split-Path $armBin.FullName)
+    Ok "ARM toolchain ready: $($armBin.Directory)"
+}
+
+# --- Pico SDK 2.2.0 + TinyUSB 0.20.0 (mirrors build-firmware.yml) -------------
+function Ensure-PicoSdk {
+    if (-not (Test-Path (Join-Path $SdkPath 'pico_sdk_init.cmake'))) {
+        Info "Cloning Pico SDK $PICO_SDK_REF..."
+        git clone --depth 1 --branch $PICO_SDK_REF `
+            https://github.com/raspberrypi/pico-sdk.git $SdkPath
+        git -C $SdkPath submodule update --init --recursive
+    } else {
+        Ok 'Pico SDK already present.'
+    }
+    $tinyusb = Join-Path $SdkPath 'lib\tinyusb'
+    $onTag = (git -C $tinyusb describe --tags --exact-match 2>$null)
+    if ($onTag -ne $TINYUSB_REF) {
+        Info "Switching TinyUSB to $TINYUSB_REF..."
+        if (-not (git -C $tinyusb rev-parse -q --verify "refs/tags/$TINYUSB_REF" 2>$null)) {
+            git -C $tinyusb fetch --depth 1 origin "refs/tags/${TINYUSB_REF}:refs/tags/$TINYUSB_REF"
+        }
+        git -C $tinyusb checkout --detach $TINYUSB_REF
+    } else {
+        Ok "TinyUSB already at $TINYUSB_REF."
+    }
+}
+
+# ---------------------------------------------------------------------------- #
+#  Main                                                                        #
+# ---------------------------------------------------------------------------- #
+Info "DS5Dongle Windows builder - variant: $Variant"
+New-Item -ItemType Directory -Force -Path $ToolsHome | Out-Null
+Add-CommonToolPaths
+
+# CMakeLists.txt includes ~/.pico-sdk/cmake/pico-vscode.cmake if present, which
+# can override the SDK/toolchain versions. Warn so the user knows why a stale
+# Pico VS Code install might change the build.
+$picoVscode = Join-Path $env:USERPROFILE '.pico-sdk\cmake\pico-vscode.cmake'
+if (Test-Path $picoVscode) {
+    Warn "Found $picoVscode - the Pico VS Code extension may override SDK/toolchain"
+    Warn 'versions. If the build misbehaves, this script still passes the pinned'
+    Warn "PICO_SDK_PATH ($SdkPath) explicitly, which normally wins."
+}
+
+$useWinget = Initialize-PackageManager
+
+Ensure-Tool -Command 'git'    -WingetId 'Git.Git'           -WingetAvailable $useWinget -PortableInstall {
+    Install-PortableArchiveTool -Name 'git' `
+        -Url 'https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/MinGit-2.47.1-64-bit.zip' `
+        -BinSubdir 'cmd'
+}
+Ensure-Tool -Command 'cmake'  -WingetId 'Kitware.CMake'      -WingetAvailable $useWinget -PortableInstall {
+    Install-PortableArchiveTool -Name 'cmake' `
+        -Url 'https://github.com/Kitware/CMake/releases/download/v3.31.3/cmake-3.31.3-windows-x86_64.zip' `
+        -BinSubdir 'cmake-3.31.3-windows-x86_64\bin'
+}
+Ensure-Tool -Command 'ninja'  -WingetId 'Ninja-build.Ninja'  -WingetAvailable $useWinget -PortableInstall {
+    Install-PortableArchiveTool -Name 'ninja' `
+        -Url 'https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip' ''
+}
+Ensure-Tool -Command 'python' -WingetId 'Python.Python.3.12' -WingetAvailable $useWinget -PortableInstall {
+    Install-PortableArchiveTool -Name 'python' `
+        -Url 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-embed-amd64.zip' ''
+}
+
+Ensure-ArmToolchain
+Ensure-PicoSdk
+
+# --- Project submodules (lib/WDL, lib/opus per .gitmodules) -------------------
+Info 'Initialising project submodules (WDL, opus)...'
+git -C $RepoRoot submodule update --init --recursive
+
+# --- Configure + build -------------------------------------------------------
+$buildDir = Join-Path $RepoRoot "build\$Variant"
+if ($Clean -and (Test-Path $buildDir)) {
+    Info "Cleaning $buildDir..."
+    Remove-Item -Recurse -Force $buildDir
+}
+
+$cmakeArgs = @(
+    '-S', $RepoRoot, '-B', $buildDir, '-G', 'Ninja',
+    '-DCMAKE_BUILD_TYPE=Release',
+    "-DPICO_SDK_PATH=$SdkPath"
+)
+switch ($Variant) {
+    'debug' { $cmakeArgs += @('-DENABLE_SERIAL=ON', '-DENABLE_VERBOSE=ON') }
+    'wake'  { $cmakeArgs += @('-DENABLE_WAKE_HID=ON') }
+}
+
+Info "Configuring: cmake $($cmakeArgs -join ' ')"
+& cmake @cmakeArgs
+if ($LASTEXITCODE -ne 0) { Die 'CMake configure failed.' }
+
+Info 'Building ds5-bridge...'
+& cmake --build $buildDir --target ds5-bridge
+if ($LASTEXITCODE -ne 0) { Die 'Build failed.' }
+
+# --- Collect output ----------------------------------------------------------
+$uf2 = Join-Path $buildDir 'ds5-bridge.uf2'
+if (-not (Test-Path $uf2)) { Die "Expected $uf2 was not produced." }
+
+$outName = if ($Variant -eq 'standard') { 'ds5-bridge.uf2' } else { "ds5-bridge-$Variant.uf2" }
+$nextToScript = Join-Path $PSScriptRoot $outName
+Copy-Item $uf2 $nextToScript -Force
+$desktop = [Environment]::GetFolderPath('Desktop')
+$onDesktop = Join-Path $desktop $outName
+Copy-Item $uf2 $onDesktop -Force
+
+Write-Host ''
+Ok  "Build succeeded! Firmware ($Variant):"
+Ok  "  $nextToScript"
+Ok  "  $onDesktop"
+Write-Host ''
+Info 'Flash it:'
+Info '  1. Hold BOOTSEL on the Pico2W and plug it in via USB.'
+Info '  2. It mounts as a USB drive (RP2350).'
+Info "  3. Drag $outName onto that drive. The Pico reboots into the firmware."
